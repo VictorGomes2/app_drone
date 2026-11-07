@@ -25,7 +25,7 @@
   #mp-actions { display:none; position:absolute; right:86px; bottom:24px; z-index:130; width:210px; gap:8px; flex-direction:column; pointer-events:auto; }
   #mp-actions button { border:1px solid #00d4ff; background:rgba(0,15,30,.92); color:white; padding:10px; cursor:pointer; font-weight:800; letter-spacing:.5px; }
   #mp-actions button.active { border-color:#ff4136; color:#ff6b63; background:rgba(80,0,0,.7); }
-  #combat-crosshair { display:none; position:absolute; z-index:125; left:calc(50% - 18px); top:calc(50% - 18px); width:36px; height:36px; pointer-events:none; }
+  #combat-crosshair.locked { display:block !important; }\n  #combat-crosshair { display:none; position:absolute; z-index:125; left:calc(50% - 18px); top:calc(50% - 18px); width:36px; height:36px; pointer-events:none; }
   #combat-crosshair:before,#combat-crosshair:after { content:""; position:absolute; background:#ff4136; box-shadow:0 0 5px #000; }
   #combat-crosshair:before { width:2px;height:36px;left:17px;top:0; }
   #combat-crosshair:after { height:2px;width:36px;left:0;top:17px; }
@@ -299,9 +299,9 @@
 </div>
 <div id="combat-crosshair"><i></i></div>
 <div id="mp-actions">
-  <button id="mp-pickup">📦 PEGAR / ENTREGAR CARGA</button>
+  <button id="mp-pickup">📦 PEGAR / ENTREGAR CARGA (L)</button>
   <button id="mp-weapon">⚠ ATIVAR ARMAMENTO: OFF</button>
-  <button id="mp-fire">◎ DISPARAR</button>
+  <button id="mp-fire">◎ DISPARAR (BOTÃO ESQUERDO)</button>
 </div>
 
 <div id="osd-layer">
@@ -935,6 +935,11 @@ class MainEngine {
     this.deliveryTarget = null;
     this.deliveryScore = 0;
     this.deliveryPads = [];
+    this.activeCrateMesh = null;
+    this.activeCratePad = null;
+    this.deliveryAvailable = false;
+    this.combatAimYaw = 0;
+    this.combatAimPitch = 0;
     this.projectiles = [];
 
     this.bindAuthUI();
@@ -1144,6 +1149,7 @@ class MainEngine {
         if (["arrowup", "arrowdown", "arrowleft", "arrowright", "w", "a", "s", "d", " "].includes(key)) e.preventDefault();
         this.keys[key] = true;
         if (key === ' ' && this.gameMode === 'multiplayer') this.fireWeapon();
+        if (key === 'l' && this.gameMode === 'multiplayer') this.interactDelivery();
         if (key === 'c') this.cycleView();
         if (this.keys['s'] && this.keys['arrowdown'] && !this.cscTriggered && this.state !== FLIGHT_STATES.BOOT) {
             this.cscTriggered = true;
@@ -1160,8 +1166,28 @@ class MainEngine {
         }
     });
 
-    document.addEventListener('mousedown', (e) => { if(e.button === 1) this.isMiddleMouseDown = true; });
+    document.addEventListener('mousedown', (e) => {
+        if(e.button === 1) this.isMiddleMouseDown = true;
+        if(e.button === 0 && this.gameMode === 'multiplayer' && this.weaponEnabled && e.target.closest('#webgl-container')) {
+            if(document.pointerLockElement !== document.getElementById('webgl-container')) {
+                document.getElementById('webgl-container').requestPointerLock?.();
+            } else {
+                this.fireWeapon();
+            }
+        }
+    });
     document.addEventListener('mouseup', (e) => { if(e.button === 1) this.isMiddleMouseDown = false; });
+    document.addEventListener('mousemove', (e) => {
+        if(this.gameMode !== 'multiplayer' || !this.weaponEnabled ||
+           document.pointerLockElement !== document.getElementById('webgl-container')) return;
+        this.combatAimYaw -= e.movementX * 0.0022;
+        this.combatAimPitch -= e.movementY * 0.0022;
+        this.combatAimPitch = THREE.MathUtils.clamp(this.combatAimPitch, -0.85, 0.85);
+    });
+    document.addEventListener('pointerlockchange', () => {
+        const locked = document.pointerLockElement === document.getElementById('webgl-container');
+        document.getElementById('combat-crosshair').classList.toggle('locked', locked);
+    });
     
     document.addEventListener('wheel', (e) => {
         if(this.state === FLIGHT_STATES.BOOT || this.camMode !== 'fpv') return;
@@ -1417,8 +1443,19 @@ class MainEngine {
     this.socket.on('remote_drone_moved', data => this.updateRemotePlayer(data));
     this.socket.on('drone_disconnected', id => this.removeRemotePlayer(id));
     this.socket.on('weapon_state', data => this.updateRemoteWeapon(data));
+    this.socket.on('delivery_available', data => this.showDeliveryPackage(data));
+    this.socket.on('delivery_expired', () => {
+      if(this.activeCrateMesh){this.scene.remove(this.activeCrateMesh);this.activeCrateMesh=null;}
+      if(this.deliveryState==='pickup'){this.deliveryState='idle';this.deliveryTarget=null;this.deliveryAvailable=false;document.getElementById('mp-delivery').textContent='ENCOMENDA EXPIRADA — AGUARDE O PRÓXIMO CICLO';}
+    });
+    this.socket.on('drone_health', data => {
+      if(data && data.id && this.remoteDrones.has(data.id)) this.updateRemotePlayer({id:data.id,position:this.remoteDrones.get(data.id).target,health:data.health});
+    });
+    this.socket.on('drone_respawned', data => {
+      if(data && data.id) this.showMsg(`${data.username || 'DRONE'} REINICIADO — VIDA 100%`, 'var(--dji-green)');
+    });
     this.socket.on('shot_fired', data => this.showRemoteShot(data));
-    this.socket.on('drone_hit', data => this.showMsg(`${data.username || 'PILOTO'} FOI ATINGIDO!`, 'var(--dji-red)'));
+    this.socket.on('drone_hit', data => this.showMsg(`${data.username || 'PILOTO'} ATINGIDO — VIDA: ${data.health ?? 0}%`, 'var(--dji-red)'));
     this.socket.on('delivery_event', data => {
       if (data && data.username === (authSys.currentUser || 'Piloto')) {
         this.deliveryScore = data.score || this.deliveryScore;
@@ -1432,8 +1469,8 @@ class MainEngine {
   createRemoteDrone(id, pilot) {
     if (!this.scene || this.remoteDrones.has(id)) return;
     const root = new THREE.Group();
-    const bodyMat = new THREE.MeshStandardMaterial({color:0x00d4ff, metalness:.55, roughness:.35, emissive:0x003344});
-    const darkMat = new THREE.MeshStandardMaterial({color:0x17212b, metalness:.6, roughness:.3});
+    const bodyMat = new THREE.MeshBasicMaterial({color:0x00dfff});
+    const darkMat = new THREE.MeshBasicMaterial({color:0x102a38});
     const body = new THREE.Mesh(new THREE.BoxGeometry(1.5,.35,1.1), bodyMat);
     root.add(body);
     const armGeo = new THREE.BoxGeometry(2.8,.12,.16);
@@ -1445,10 +1482,14 @@ class MainEngine {
     const nameCanvas = document.createElement('canvas'); nameCanvas.width=256; nameCanvas.height=64;
     const ctx=nameCanvas.getContext('2d'); ctx.fillStyle='rgba(0,0,0,.72)'; ctx.fillRect(0,0,256,64);
     ctx.fillStyle='#ffffff'; ctx.font='bold 26px Arial'; ctx.textAlign='center'; ctx.fillText(String(pilot.username || 'PILOTO').slice(0,18),128,40);
-    const label = new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(nameCanvas), transparent:true}));
-    label.position.y=2.4; label.scale.set(4,1,1); root.add(label);
+    const label = new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(nameCanvas), transparent:true, depthTest:false, depthWrite:false}));
+    label.position.y=4.2; label.scale.set(10,2.5,1); label.renderOrder=1000; root.add(label);
+    const healthBg = new THREE.Mesh(new THREE.PlaneGeometry(5,0.35),new THREE.MeshBasicMaterial({color:0x300000,depthTest:false}));
+    healthBg.position.set(0,5.8,0); healthBg.renderOrder=1001; root.add(healthBg);
+    const healthFill = new THREE.Mesh(new THREE.PlaneGeometry(5,0.27),new THREE.MeshBasicMaterial({color:0x35e06f,depthTest:false}));
+    healthFill.position.set(0,5.8,0.01); healthFill.renderOrder=1002; root.add(healthFill);
     this.scene.add(root);
-    this.remoteDrones.set(id,{root,target:new THREE.Vector3(),rotation:{pitch:0,yaw:0,roll:0},weapon:false});
+    this.remoteDrones.set(id,{root,target:new THREE.Vector3(),rotation:{pitch:0,yaw:0,roll:0},weapon:false,health:100,healthFill});
   }
 
   syncRemotePlayers(pilots) {
@@ -1456,7 +1497,7 @@ class MainEngine {
     Object.entries(pilots).forEach(([id,pilot])=>{
       if (this.socket && id === this.socket.id) return;
       this.createRemoteDrone(id,pilot);
-      this.updateRemotePlayer({id,position:pilot.position,rotation:pilot.rotation,weapon:pilot.weapon});
+      this.updateRemotePlayer({id,position:pilot.position,rotation:pilot.rotation,weapon:pilot.weapon,health:pilot.health});
     });
     for (const id of this.remoteDrones.keys()) if (!pilots[id]) this.removeRemotePlayer(id);
     document.getElementById('mp-count').textContent = Object.keys(pilots).length;
@@ -1468,6 +1509,12 @@ class MainEngine {
     const remote=this.remoteDrones.get(data.id); if(!remote) return;
     remote.target.set(Number(data.position.x)||0,Number(data.position.y)||0,Number(data.position.z)||0);
     remote.rotation=data.rotation || remote.rotation;
+    if (Number.isFinite(data.health)) {
+      remote.health = Math.max(0, Math.min(100, data.health));
+      remote.healthFill.scale.x = Math.max(0.001, remote.health / 100);
+      remote.healthFill.position.x = -2.5 + 2.5 * (remote.health / 100);
+      remote.healthFill.material.color.setHex(remote.health > 50 ? 0x35e06f : (remote.health > 25 ? 0xffb020 : 0xff3030));
+    }
     if (typeof data.weapon === 'boolean') {
       remote.weapon=data.weapon;
       const body=remote.root.children[0];
@@ -1485,23 +1532,24 @@ class MainEngine {
   toggleWeapon() {
     if(this.gameMode!=='multiplayer') return;
     this.weaponEnabled=!this.weaponEnabled;
+    this.combatAimYaw = 0; this.combatAimPitch = 0;
+    if(!this.weaponEnabled && document.pointerLockElement) document.exitPointerLock?.();
     document.getElementById('mp-weapon').classList.toggle('active',this.weaponEnabled);
     document.getElementById('mp-weapon').textContent=`⚠ ARMAMENTO: ${this.weaponEnabled?'ON':'OFF'}`;
     document.getElementById('combat-crosshair').style.display=this.weaponEnabled?'block':'none';
     if(this.socket) this.socket.emit('weapon_toggle',{enabled:this.weaponEnabled});
-    this.showMsg(this.weaponEnabled?'SISTEMA DE COMBATE ATIVADO':'SISTEMA DE COMBATE DESATIVADO',this.weaponEnabled?'var(--dji-red)':'var(--dji-green)');
+    this.showMsg(this.weaponEnabled?'COMBATE ATIVO — CLIQUE NA ÁREA DE VOO PARA CONTROLAR A MIRA COM O MOUSE. ESC LIBERA.':'SISTEMA DE COMBATE DESATIVADO',this.weaponEnabled?'var(--dji-red)':'var(--dji-green)');
   }
 
   fireWeapon() {
     if(this.gameMode!=='multiplayer'||!this.weaponEnabled||!this.socket||!this.socket.connected) return;
-    const now=Date.now(); if(now-this.lastShotAt<450) return; this.lastShotAt=now;
-    const origin=this.drone.obj.position.clone();
-    const direction=new THREE.Vector3(0,0,-1).applyEuler(this.drone.obj.rotation).normalize();
-    const end=origin.clone().add(direction.multiplyScalar(260));
-    const points=[origin,end];
-    const geometry=new THREE.BufferGeometry().setFromPoints(points);
+    const now=Date.now(); if(now-this.lastShotAt<350) return; this.lastShotAt=now;
+    const origin=this.camera.getWorldPosition(new THREE.Vector3());
+    const direction=this.camera.getWorldDirection(new THREE.Vector3()).normalize();
+    const end=origin.clone().add(direction.clone().multiplyScalar(500));
+    const geometry=new THREE.BufferGeometry().setFromPoints([origin,end]);
     const line=new THREE.Line(geometry,new THREE.LineBasicMaterial({color:0xff4136,transparent:true,opacity:.9}));
-    this.scene.add(line); setTimeout(()=>{this.scene.remove(line);geometry.dispose();line.material.dispose();},120);
+    this.scene.add(line); setTimeout(()=>{this.scene.remove(line);geometry.dispose();line.material.dispose();},100);
     this.socket.emit('fire_weapon',{position:{x:origin.x,y:origin.y,z:origin.z},direction:{x:direction.x,y:direction.y,z:direction.z}});
   }
 
@@ -1532,46 +1580,68 @@ class MainEngine {
     const positions=[new THREE.Vector3(60,.18,60),new THREE.Vector3(-60,.18,180),new THREE.Vector3(180,.18,-60),new THREE.Vector3(-180,.18,-180)];
     this.deliveryPads=positions.map((pos,index)=>{
       const group=new THREE.Group();
-      const base=new THREE.Mesh(new THREE.CylinderGeometry(7,7,.25,32),new THREE.MeshStandardMaterial({color:index===0?0x00cc88:0x00aaff,emissive:index===0?0x004422:0x002244,emissiveIntensity:.65}));
+      const base=new THREE.Mesh(new THREE.CylinderGeometry(7,7,.25,32),new THREE.MeshBasicMaterial({color:0x1688a8}));
       base.position.copy(pos); group.add(base);
-      const ring=new THREE.Mesh(new THREE.TorusGeometry(8,.22,8,40),new THREE.MeshBasicMaterial({color:0xffffff}));
+      const ring=new THREE.Mesh(new THREE.TorusGeometry(8,.22,8,40),new THREE.MeshBasicMaterial({color:0x65eaff}));
       ring.rotation.x=Math.PI/2; ring.position.set(pos.x,pos.y+.2,pos.z); group.add(ring);
-      const beacon=new THREE.Mesh(new THREE.ConeGeometry(1.2,5,8),new THREE.MeshBasicMaterial({color:0xffdc00}));
+      const beacon=new THREE.Mesh(new THREE.ConeGeometry(1.2,5,8),new THREE.MeshBasicMaterial({color:0x65eaff}));
       beacon.position.set(pos.x,pos.y+5,pos.z); group.add(beacon);
       this.scene.add(group); return {group,position:pos.clone(),name:`PONTO ${index+1}`};
     });
-    this.deliveryState='pickup';
-    this.deliveryTarget=this.deliveryPads[0];
-    this.deliveryPads[0].group.children[0].material.color.setHex(0xffaa00);
-    document.getElementById('mp-delivery').textContent='RETIRE A CARGA NO PONTO 1';
+    this.deliveryState='idle';
+    this.deliveryTarget=null;
+    document.getElementById('mp-delivery').textContent='AGUARDANDO NOVA ENTREGA';
+  }
+
+  showDeliveryPackage(data) {
+    if(!this.deliveryPads.length || !data) return;
+    if(this.activeCrateMesh){this.scene.remove(this.activeCrateMesh);this.activeCrateMesh=null;}
+    const index=Number.isInteger(data.padIndex) ? data.padIndex % this.deliveryPads.length : 0;
+    this.activeCratePad=this.deliveryPads[index];
+    const crate=new THREE.Group();
+    const box=new THREE.Mesh(new THREE.BoxGeometry(2.4,2.4,2.4),new THREE.MeshBasicMaterial({color:0xffb000}));
+    const stripe=new THREE.Mesh(new THREE.BoxGeometry(2.5,.28,2.5),new THREE.MeshBasicMaterial({color:0xffffff}));
+    stripe.position.y=.25; crate.add(box,stripe);
+    crate.position.copy(this.activeCratePad.position); crate.position.y+=3.2;
+    this.scene.add(crate); this.activeCrateMesh=crate;
+    this.deliveryAvailable=true; this.deliveryState='pickup'; this.deliveryTarget=this.activeCratePad;
+    document.getElementById('mp-delivery').textContent=`📦 ENCOMENDA DISPONÍVEL — ${this.activeCratePad.name} (L)`;
+    this.showMsg('NOVA ENCOMENDA DISPONÍVEL! PRESSIONE L PRÓXIMO AO PACOTE.', 'var(--dji-green)');
   }
 
   interactDelivery() {
     if(this.gameMode!=='multiplayer'||!this.deliveryPads.length) return;
     const pos=this.drone.obj.position;
-    const near=this.deliveryPads.find(p=>Math.hypot(pos.x-p.position.x,pos.z-p.position.z)<13 && Math.abs(pos.y-p.position.y)<8);
-    if(!near){this.showMsg('APROXIME-SE DE UM TERMINAL DE ENTREGA', 'var(--fab-gold)');return;}
-    if(this.deliveryState==='pickup'){
-      if(near!==this.deliveryTarget){this.showMsg('SIGA AO PONTO DE COLETA INDICADO', 'var(--fab-gold)');return;}
+    if(this.deliveryState==='idle' || !this.deliveryTarget) {
+      this.showMsg('NENHUMA ENCOMENDA DISPONÍVEL. AGUARDE O PRÓXIMO CICLO.', 'var(--fab-gold)'); return;
+    }
+    const near=Math.hypot(pos.x-this.deliveryTarget.position.x,pos.z-this.deliveryTarget.position.z);
+    const vertical=Math.abs(pos.y-this.deliveryTarget.position.y);
+    if(near>80 || vertical>65) {
+      this.showMsg('APROXIME-SE DO PONTO INDICADO (RAIO DE 80 m).', 'var(--fab-gold)'); return;
+    }
+    if(this.deliveryState==='pickup') {
+      const pickupPad=this.deliveryTarget;
       this.deliveryState='dropoff';
-      this.deliveryTarget=this.deliveryPads.find(p=>p!==near);
+      if(this.activeCrateMesh){this.scene.remove(this.activeCrateMesh);this.activeCrateMesh=null;}
+      this.activeCratePad=null; this.deliveryAvailable=false;
+      const pickupIndex=this.deliveryPads.indexOf(pickupPad);
+      this.deliveryTarget=this.deliveryPads[(pickupIndex+1)%this.deliveryPads.length];
       if(!this.cargoMesh){
-        this.cargoMesh=new THREE.Mesh(new THREE.BoxGeometry(.8,.65,.8),new THREE.MeshStandardMaterial({color:0xffaa00,roughness:.65}));
+        this.cargoMesh=new THREE.Mesh(new THREE.BoxGeometry(.8,.65,.8),new THREE.MeshBasicMaterial({color:0xffaa00}));
         this.cargoMesh.position.set(0,-.45,0); this.drone.obj.add(this.cargoMesh);
       }
-      document.getElementById('mp-delivery').textContent=`ENTREGUE EM ${this.deliveryTarget.name}`;
-      this.showMsg('CARGA COLETADA. SIGA AO DESTINO.', 'var(--dji-green)');
-      if(this.socket)this.socket.emit('delivery_action',{action:'pickup',pad:near.name});
+      document.getElementById('mp-delivery').textContent=`LEVE A CARGA ATÉ ${this.deliveryTarget.name} (L)`;
+      this.showMsg('PACOTE COLETADO! SIGA AO DESTINO INDICADO.', 'var(--dji-green)');
+      if(this.socket)this.socket.emit('delivery_action',{action:'pickup',pad:'coleta'});
     } else {
-      if(near!==this.deliveryTarget){this.showMsg('ESTE NÃO É O DESTINO INDICADO', 'var(--dji-red)');return;}
       this.deliveryScore+=100;
       document.getElementById('mp-score').textContent=this.deliveryScore;
-      this.deliveryState='pickup';
+      this.deliveryState='idle'; this.deliveryTarget=null;
       if(this.cargoMesh){this.drone.obj.remove(this.cargoMesh);this.cargoMesh.geometry.dispose();this.cargoMesh.material.dispose();this.cargoMesh=null;}
-      this.deliveryTarget=this.deliveryPads[(this.deliveryPads.indexOf(near)+1)%this.deliveryPads.length];
-      document.getElementById('mp-delivery').textContent=`RETIRE A CARGA EM ${this.deliveryTarget.name}`;
+      document.getElementById('mp-delivery').textContent='ENTREGA CONCLUÍDA — AGUARDE NOVA ENCOMENDA';
       this.showMsg('ENTREGA CONCLUÍDA: +100 PONTOS', 'var(--dji-green)');
-      if(this.socket)this.socket.emit('delivery_action',{action:'delivered',pad:near.name,score:this.deliveryScore});
+      if(this.socket)this.socket.emit('delivery_action',{action:'delivered',pad:'destino'});
     }
   }
 
@@ -1711,6 +1781,17 @@ class MainEngine {
 
   updateCamera(dt) {
     if(this.state === FLIGHT_STATES.CRASHED) return; 
+    if (this.gameMode==='multiplayer' && this.weaponEnabled) {
+      const baseYaw=this.drone.rotation.yaw || 0;
+      const yaw=baseYaw+this.combatAimYaw;
+      const pitch=this.combatAimPitch;
+      const dir=new THREE.Vector3(-Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),-Math.cos(yaw)*Math.cos(pitch));
+      const target=this.drone.obj.position.clone().add(dir.multiplyScalar(100));
+      const camPos=this.drone.obj.position.clone().add(new THREE.Vector3(0,2.2,0));
+      this.camera.position.lerp(camPos,Math.min(1,dt*12));
+      this.camera.lookAt(target);
+      return;
+    }
     if (this.camMode === 'chase') {
       const offset = new THREE.Vector3(0, 3, 10);
       const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), this.drone.rotation.yaw);
@@ -2324,13 +2405,20 @@ class CityGenerator {
     const instPark = new THREE.InstancedMesh(bldgGeom, parkMat, 200); instPark.receiveShadow = true;
     const instHelipad = new THREE.InstancedMesh(helipadGeom, helipadMat, 100); instHelipad.receiveShadow = true;
 
+    // Instâncias dos equipamentos de cobertura usados na geração dos edifícios.
+    const rooftopGeom = new THREE.BoxGeometry(3, 1, 3);
+    const rooftopMat = new THREE.MeshStandardMaterial({ color: 0x55595f, roughness: 0.85 });
+    const rooftopInst = new THREE.InstancedMesh(rooftopGeom, rooftopMat, 1200);
+    rooftopInst.castShadow = true;
+    rooftopInst.receiveShadow = true;
+
     const treeTrunkInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.3, 0.4, 3), new THREE.MeshStandardMaterial({color: 0x4a3b32}), 2500);
     const treeLeavesInst = new THREE.InstancedMesh(new THREE.SphereGeometry(2.5, 5, 5), new THREE.MeshStandardMaterial({color: 0x228B22, roughness: 0.9}), 2500);
     const benchInst = new THREE.InstancedMesh(new THREE.BoxGeometry(2, 0.6, 0.8), new THREE.MeshStandardMaterial({color: 0x6b5b4e}), 1000);
     const pathInst = new THREE.InstancedMesh(new THREE.PlaneGeometry(4, 30), new THREE.MeshStandardMaterial({color: 0x8B4513}), 400); 
 
     const dummy = new THREE.Object3D(); 
-    let sIdx = 0, c1Idx = 0, c2Idx = 0, rIdx = 0, gIdx = 0, pIdx = 0, tIdx = 0, benchIdx = 0, heliIdx = 0, pathIdx = 0, roofIdx = 0, crosswalkIdx = 0;
+    let sIdx = 0, c1Idx = 0, c2Idx = 0, rIdx = 0, gIdx = 0, pIdx = 0, tIdx = 0, benchIdx = 0, heliIdx = 0, pathIdx = 0, roofIdx = 0;
 
     for(let cx = -1200; cx <= 1200; cx += this.cellSize) {
       for(let cz = -1200; cz <= 1200; cz += this.cellSize) {
@@ -2530,7 +2618,7 @@ class CityGenerator {
     curbMesh.instanceMatrix.needsUpdate = true; sidewalkMesh.instanceMatrix.needsUpdate = true; 
     instCom1.instanceMatrix.needsUpdate = true; instCom2.instanceMatrix.needsUpdate = true;
     instResi.instanceMatrix.needsUpdate = true; instGlass.instanceMatrix.needsUpdate = true;
-    instPark.instanceMatrix.needsUpdate = true; instHelipad.instanceMatrix.needsUpdate = true; rooftopInst.instanceMatrix.needsUpdate = true; crosswalkInst.instanceMatrix.needsUpdate = true;
+    instPark.instanceMatrix.needsUpdate = true; instHelipad.instanceMatrix.needsUpdate = true; rooftopInst.instanceMatrix.needsUpdate = true;
     treeTrunkInst.instanceMatrix.needsUpdate = true; treeLeavesInst.instanceMatrix.needsUpdate = true;
     benchInst.instanceMatrix.needsUpdate = true; pathInst.instanceMatrix.needsUpdate = true;
     mainPoleInst.instanceMatrix.needsUpdate = true; mainWireInst.instanceMatrix.needsUpdate = true;
@@ -2538,7 +2626,7 @@ class CityGenerator {
     
     this.scene.add(curbMesh); this.scene.add(sidewalkMesh); 
     this.scene.add(instCom1); this.scene.add(instCom2); 
-    this.scene.add(instResi); this.scene.add(instGlass); this.scene.add(instPark); this.scene.add(instHelipad); this.scene.add(rooftopInst); this.scene.add(crosswalkInst);
+    this.scene.add(instResi); this.scene.add(instGlass); this.scene.add(instPark); this.scene.add(instHelipad); this.scene.add(rooftopInst);
     this.scene.add(treeTrunkInst); this.scene.add(treeLeavesInst); this.scene.add(benchInst); this.scene.add(pathInst);
     this.scene.add(mainPoleInst); this.scene.add(mainWireInst);
     this.scene.add(streetlightInst); this.scene.add(trafficInst);
