@@ -1,6 +1,3 @@
-import eventlet
-eventlet.monkey_patch()
-
 import os
 import base64
 import math
@@ -17,8 +14,12 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 db_url = os.environ.get("DATABASE_URL", "sqlite:///local_aeroengine.db")
+
+# Neon/Render: use the installed psycopg2-binary driver explicitly.
 if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+elif db_url.startswith("postgresql://"):
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -27,7 +28,7 @@ db = SQLAlchemy(app)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
+    async_mode="threading",
     ping_interval=25,
     ping_timeout=60,
     max_http_buffer_size=1_000_000,
