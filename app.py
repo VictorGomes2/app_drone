@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit
+from sqlalchemy import text
 
 # =========================================================
 # AEROENGINE — API, AUTENTICAÇÃO E ESPAÇO AÉREO MULTIPLAYER
@@ -115,7 +116,57 @@ def delivery_scheduler():
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"status": "ok", "service": "aeroengine", "online": len(active_pilots)})
+    """Verifica o backend e a conexão real com o PostgreSQL/Neon."""
+    database_status = "ok"
+    http_status = 200
+
+    try:
+        db.session.execute(text("SELECT 1"))
+    except Exception as exc:
+        db.session.rollback()
+        database_status = "error"
+        http_status = 503
+        app.logger.exception("Falha na verificação de saúde do banco de dados")
+
+    return jsonify({
+        "status": "ok" if http_status == 200 else "degraded",
+        "service": "aeroengine",
+        "backend": "ok",
+        "database": database_status,
+        "online": len(active_pilots)
+    }), http_status
+
+
+@app.get("/healthz/render")
+def healthz_render():
+    """Verifica somente se o backend Flask está respondendo."""
+    return jsonify({
+        "status": "ok",
+        "service": "aeroengine",
+        "backend": "ok",
+        "online": len(active_pilots)
+    })
+
+
+@app.get("/healthz/neon")
+def healthz_neon():
+    """Executa uma consulta simples para validar/ativar o PostgreSQL do Neon."""
+    try:
+        db.session.execute(text("SELECT 1"))
+        return jsonify({
+            "status": "ok",
+            "service": "aeroengine",
+            "database": "ok",
+            "check": "SELECT 1"
+        }), 200
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Falha ao acessar o PostgreSQL/Neon")
+        return jsonify({
+            "status": "error",
+            "service": "aeroengine",
+            "database": "unavailable"
+        }), 503
 
 @app.get("/api/online")
 def online_status():
