@@ -2,7 +2,7 @@ import os
 import base64
 import math
 from threading import RLock
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit
@@ -12,6 +12,14 @@ from flask_socketio import SocketIO, emit
 # =========================================================
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+
+# Entrega a interface principal do simulador na URL raiz do serviço.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+@app.get("/")
+def index():
+    return send_from_directory(BASE_DIR, "index.html")
 
 db_url = os.environ.get("DATABASE_URL", "sqlite:///local_aeroengine.db")
 
