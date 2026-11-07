@@ -1,6 +1,7 @@
 import os
 import base64
 import math
+import random
 from threading import RLock
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -67,6 +68,7 @@ SPAWN_POINTS = [
 active_pilots = {}
 spawn_index = 0
 state_lock = RLock()
+delivery_scheduler_started = False
 
 def safe_number(value, default=0.0, limit=10000):
     try:
@@ -87,6 +89,7 @@ def public_airspace():
             "rotation": dict(pilot["rotation"]),
             "weapon": pilot["weapon"],
             "score": pilot["score"],
+            "health": pilot.get("health", 100),
         }
         for sid, pilot in active_pilots.items()
     }
@@ -95,6 +98,20 @@ def broadcast_airspace():
     snapshot = public_airspace()
     socketio.emit("airspace_update", snapshot)
     socketio.emit("player_count", {"count": len(snapshot)})
+
+
+def delivery_scheduler():
+    """Publica uma encomenda em um dos pontos a cada ciclo do multiplayer."""
+    while True:
+        socketio.sleep(60)
+        with state_lock:
+            has_players = bool(active_pilots)
+        if not has_players:
+            continue
+        event_data = {"padIndex": random.randrange(4), "expiresIn": 45000}
+        socketio.emit("delivery_available", event_data)
+        socketio.sleep(45)
+        socketio.emit("delivery_expired", {})
 
 @app.get("/healthz")
 def healthz():
@@ -171,7 +188,7 @@ def handle_disconnect():
 
 @socketio.on("join_airspace")
 def handle_join(data):
-    global spawn_index
+    global spawn_index, delivery_scheduler_started
     data = data if isinstance(data, dict) else {}
     username = str(data.get("username", "Piloto")).strip()[:24] or "Piloto"
     drone_type = str(data.get("droneType", "mini3"))[:24]
@@ -188,8 +205,13 @@ def handle_join(data):
             "weapon": False,
             "score": 0,
             "has_package": False,
+            "health": 100,
         }
         snapshot = public_airspace()
+
+    if not delivery_scheduler_started:
+        delivery_scheduler_started = True
+        socketio.start_background_task(delivery_scheduler)
 
     emit("flight_clearance", {"spawnPoint": spawn})
     emit("airspace_update", snapshot)
@@ -231,6 +253,7 @@ def handle_telemetry(data):
             "position": position,
             "rotation": rotation,
             "weapon": pilot["weapon"],
+            "health": pilot.get("health", 100),
         }
     socketio.emit("remote_drone_moved", payload, skip_sid=request.sid)
 
@@ -258,24 +281,28 @@ def handle_fire_weapon(data):
         return
     dx, dy, dz = dx/norm, dy/norm, dz/norm
 
+    hit = None
+    respawn_id = None
     with state_lock:
         shooter = active_pilots.get(request.sid)
         if not shooter or not shooter["weapon"]:
             return
         shooter_name = shooter["username"]
-        hit = None
         for sid, target in active_pilots.items():
-            if sid == request.sid:
+            if sid == request.sid or target.get("health", 100) <= 0:
                 continue
             tp = target["position"]
             vx, vy, vz = tp["x"]-ox, tp["y"]-oy, tp["z"]-oz
             along = vx*dx + vy*dy + vz*dz
-            if along < 0 or along > 260:
+            if along < 0 or along > 500:
                 continue
             perp2 = (vx-along*dx)**2 + (vy-along*dy)**2 + (vz-along*dz)**2
-            if perp2 <= 16:
-                hit = {"id": sid, "username": target["username"]}
+            if perp2 <= 25:
+                target["health"] = max(0, target.get("health", 100) - 25)
                 target["score"] = max(0, target["score"] - 10)
+                hit = {"id": sid, "username": target["username"], "health": target["health"]}
+                if target["health"] <= 0:
+                    respawn_id = sid
                 break
 
     socketio.emit("shot_fired", {
@@ -286,8 +313,33 @@ def handle_fire_weapon(data):
     if hit:
         socketio.emit("drone_hit", {
             "id": hit["id"], "username": hit["username"],
-            "by": shooter_name, "message": f"{hit['username']} foi atingido por {shooter_name}."
+            "by": shooter_name, "health": hit["health"],
+            "message": f"{hit['username']} foi atingido por {shooter_name}. Vida: {hit['health']}%."
         })
+        socketio.emit("drone_health", hit)
+    if respawn_id:
+        socketio.start_background_task(respawn_drone, respawn_id)
+
+
+def respawn_drone(sid):
+    socketio.sleep(3)
+    with state_lock:
+        pilot = active_pilots.get(sid)
+        if not pilot:
+            return
+        spawn = dict(SPAWN_POINTS[random.randrange(len(SPAWN_POINTS))])
+        pilot["position"] = spawn
+        pilot["rotation"] = {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
+        pilot["health"] = 100
+        pilot["weapon"] = False
+        payload = {
+            "id": sid, "position": spawn,
+            "rotation": pilot["rotation"], "weapon": False, "health": 100
+        }
+        username = pilot["username"]
+    socketio.emit("remote_drone_moved", payload)
+    socketio.emit("drone_respawned", {"id": sid, "username": username})
+
 
 @socketio.on("delivery_action")
 def handle_delivery_action(data):
