@@ -2,7 +2,11 @@ import os
 import base64
 import math
 import random
-from threading import RLock
+import logging
+import time
+import urllib.request
+import urllib.error
+from threading import RLock, Thread, Event
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
@@ -34,6 +38,148 @@ elif db_url.startswith("postgresql://"):
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
+
+
+# =========================================================
+# KEEP ALIVE — RENDER + NEON
+# =========================================================
+def env_bool(name, default=False):
+    """Lê variáveis booleanas do Render com valores previsíveis."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on", "sim")
+
+
+def env_int(name, default, minimum=1):
+    """Lê intervalos numéricos sem derrubar a aplicação por configuração inválida."""
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        app.logger.warning("Variável %s inválida; usando %s segundos.", name, default)
+        return default
+
+
+KEEP_ALIVE_ENABLED = env_bool("KEEP_ALIVE_ENABLED", False)
+KEEP_ALIVE_INTERVAL = env_int("KEEP_ALIVE_INTERVAL", 60, minimum=15)
+KEEP_ALIVE_TIMEOUT = env_int("KEEP_ALIVE_TIMEOUT", 30, minimum=5)
+KEEP_ALIVE_URL = os.environ.get(
+    "KEEP_ALIVE_URL",
+    "https://app-drone.onrender.com/healthz/render"
+).strip()
+
+KEEP_ALIVE_DB_ENABLED = env_bool("KEEP_ALIVE_DB_ENABLED", False)
+KEEP_ALIVE_DB_INTERVAL = env_int("KEEP_ALIVE_DB_INTERVAL", 60, minimum=15)
+
+_keep_alive_stop = Event()
+_keep_alive_thread = None
+_keep_alive_lock = RLock()
+
+
+def keep_alive_render():
+    """Faz uma requisição HTTP externa para a URL configurada do próprio serviço."""
+    if not KEEP_ALIVE_URL:
+        app.logger.warning(
+            "Keep Alive Render está habilitado, mas KEEP_ALIVE_URL está vazia."
+        )
+        return
+
+    request_obj = urllib.request.Request(
+        KEEP_ALIVE_URL,
+        headers={"User-Agent": "AeroEngine-KeepAlive/1.0"},
+        method="GET"
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request_obj, timeout=KEEP_ALIVE_TIMEOUT
+        ) as response:
+            status_code = response.getcode()
+            if 200 <= status_code < 400:
+                app.logger.info(
+                    "[KEEP-ALIVE][RENDER] Sucesso: HTTP %s em %s",
+                    status_code, KEEP_ALIVE_URL
+                )
+            else:
+                app.logger.warning(
+                    "[KEEP-ALIVE][RENDER] Resposta HTTP %s em %s",
+                    status_code, KEEP_ALIVE_URL
+                )
+    except Exception:
+        app.logger.exception(
+            "[KEEP-ALIVE][RENDER] Falha ao acessar %s", KEEP_ALIVE_URL
+        )
+
+
+def keep_alive_neon():
+    """Executa SELECT 1 para manter/verificar a conexão com PostgreSQL/Neon."""
+    try:
+        with app.app_context():
+            db.session.execute(text("SELECT 1"))
+            db.session.commit()
+            app.logger.info("[KEEP-ALIVE][NEON] Banco respondeu ao SELECT 1.")
+    except Exception:
+        with app.app_context():
+            db.session.rollback()
+        app.logger.exception("[KEEP-ALIVE][NEON] Falha na consulta ao banco.")
+    finally:
+        with app.app_context():
+            db.session.remove()
+
+
+def keep_alive_worker():
+    """Executa cada rotina no seu próprio intervalo, sem bloquear as requisições."""
+    now = time.monotonic()
+    next_render = now + KEEP_ALIVE_INTERVAL
+    next_db = now + KEEP_ALIVE_DB_INTERVAL
+
+    app.logger.info(
+        "[KEEP-ALIVE] Worker iniciado | Render=%s (%ss) | Neon=%s (%ss)",
+        KEEP_ALIVE_ENABLED, KEEP_ALIVE_INTERVAL,
+        KEEP_ALIVE_DB_ENABLED, KEEP_ALIVE_DB_INTERVAL
+    )
+
+    while not _keep_alive_stop.is_set():
+        now = time.monotonic()
+
+        if KEEP_ALIVE_ENABLED and now >= next_render:
+            keep_alive_render()
+            next_render = time.monotonic() + KEEP_ALIVE_INTERVAL
+
+        if KEEP_ALIVE_DB_ENABLED and now >= next_db:
+            keep_alive_neon()
+            next_db = time.monotonic() + KEEP_ALIVE_DB_INTERVAL
+
+        enabled_intervals = []
+        if KEEP_ALIVE_ENABLED:
+            enabled_intervals.append(KEEP_ALIVE_INTERVAL)
+        if KEEP_ALIVE_DB_ENABLED:
+            enabled_intervals.append(KEEP_ALIVE_DB_INTERVAL)
+
+        wait_seconds = min(enabled_intervals) if enabled_intervals else 60
+        _keep_alive_stop.wait(min(5, max(1, wait_seconds)))
+
+
+def start_keep_alive_worker():
+    """Inicia somente uma thread Keep Alive por processo Python."""
+    global _keep_alive_thread
+
+    if not (KEEP_ALIVE_ENABLED or KEEP_ALIVE_DB_ENABLED):
+        app.logger.info("[KEEP-ALIVE] Rotinas desativadas pelas variáveis de ambiente.")
+        return
+
+    with _keep_alive_lock:
+        if _keep_alive_thread and _keep_alive_thread.is_alive():
+            return
+
+        _keep_alive_stop.clear()
+        _keep_alive_thread = Thread(
+            target=keep_alive_worker,
+            name="AeroEngineKeepAlive",
+            daemon=True
+        )
+        _keep_alive_thread.start()
+
 
 socketio = SocketIO(
     app,
@@ -114,45 +260,23 @@ def delivery_scheduler():
         socketio.sleep(45)
         socketio.emit("delivery_expired", {})
 
-@app.get("/healthz")
-def healthz():
-    """Verifica o backend e a conexão real com o PostgreSQL/Neon."""
-    database_status = "ok"
-    http_status = 200
-
-    try:
-        db.session.execute(text("SELECT 1"))
-    except Exception as exc:
-        db.session.rollback()
-        database_status = "error"
-        http_status = 503
-        app.logger.exception("Falha na verificação de saúde do banco de dados")
-
-    return jsonify({
-        "status": "ok" if http_status == 200 else "degraded",
-        "service": "aeroengine",
-        "backend": "ok",
-        "database": database_status,
-        "online": len(active_pilots)
-    }), http_status
-
-
 @app.get("/healthz/render")
 def healthz_render():
-    """Verifica somente se o backend Flask está respondendo."""
+    """Endpoint leve para verificar se o backend está respondendo."""
     return jsonify({
         "status": "ok",
         "service": "aeroengine",
         "backend": "ok",
         "online": len(active_pilots)
-    })
+    }), 200
 
 
 @app.get("/healthz/neon")
 def healthz_neon():
-    """Executa uma consulta simples para validar/ativar o PostgreSQL do Neon."""
+    """Verifica a conexão real com o banco PostgreSQL/Neon."""
     try:
         db.session.execute(text("SELECT 1"))
+        db.session.remove()
         return jsonify({
             "status": "ok",
             "service": "aeroengine",
@@ -161,11 +285,38 @@ def healthz_neon():
         }), 200
     except Exception:
         db.session.rollback()
-        app.logger.exception("Falha ao acessar o PostgreSQL/Neon")
+        app.logger.exception("[HEALTHZ][NEON] Falha na verificação do banco.")
+        db.session.remove()
         return jsonify({
             "status": "error",
             "service": "aeroengine",
             "database": "unavailable"
+        }), 503
+
+
+@app.get("/healthz")
+def healthz():
+    """Verifica backend e banco; retorna 503 se o banco estiver indisponível."""
+    try:
+        db.session.execute(text("SELECT 1"))
+        db.session.remove()
+        return jsonify({
+            "status": "ok",
+            "service": "aeroengine",
+            "backend": "ok",
+            "database": "ok",
+            "online": len(active_pilots)
+        }), 200
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("[HEALTHZ] Banco indisponível.")
+        db.session.remove()
+        return jsonify({
+            "status": "degraded",
+            "service": "aeroengine",
+            "backend": "ok",
+            "database": "error",
+            "online": len(active_pilots)
         }), 503
 
 @app.get("/api/online")
@@ -416,6 +567,10 @@ def handle_delivery_action(data):
 
 with app.app_context():
     db.create_all()
+
+# Em produção (Gunicorn) o módulo é carregado no processo do worker.
+# Use 1 worker no Render para evitar rotinas duplicadas.
+start_keep_alive_worker()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
