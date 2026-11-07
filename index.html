@@ -25,7 +25,10 @@
   #mp-actions { display:none; position:absolute; right:86px; bottom:24px; z-index:130; width:210px; gap:8px; flex-direction:column; pointer-events:auto; }
   #mp-actions button { border:1px solid #00d4ff; background:rgba(0,15,30,.92); color:white; padding:10px; cursor:pointer; font-weight:800; letter-spacing:.5px; }
   #mp-actions button.active { border-color:#ff4136; color:#ff6b63; background:rgba(80,0,0,.7); }
-  #combat-crosshair.locked { display:block !important; }\n  #combat-crosshair { display:none; position:absolute; z-index:125; left:calc(50% - 18px); top:calc(50% - 18px); width:36px; height:36px; pointer-events:none; }
+  #wanted-hud { display:none; position:absolute; top:132px; right:90px; z-index:140; padding:9px 13px; min-width:190px; color:#fff; background:rgba(8,8,12,.88); border:1px solid rgba(255,190,0,.65); font:800 13px monospace; text-align:right; text-shadow:0 1px 3px #000; pointer-events:none; }
+  #wanted-stars { color:#ffd21c; font-size:22px; letter-spacing:3px; display:block; }
+  #wanted-label { color:#ff7777; font-size:10px; letter-spacing:1px; }
+  #combat-crosshair { display:none; position:fixed; z-index:999; left:50%; top:50%; width:36px; height:36px; transform:translate(-50%,-50%); pointer-events:none; }
   #combat-crosshair:before,#combat-crosshair:after { content:""; position:absolute; background:#ff4136; box-shadow:0 0 5px #000; }
   #combat-crosshair:before { width:2px;height:36px;left:17px;top:0; }
   #combat-crosshair:after { height:2px;width:36px;left:0;top:17px; }
@@ -298,6 +301,12 @@
   <div class="mp-chip">PONTUAÇÃO: <span id="mp-score">0</span></div>
 </div>
 <div id="combat-crosshair"><i></i></div>
+<div id="wanted-hud">
+  <span id="wanted-label">NÍVEL DE PROCURADO</span>
+  <span id="wanted-stars">☆☆☆☆☆</span>
+  <span id="wanted-status">POLÍCIA: SEM ALERTA</span>
+</div>
+
 <div id="mp-actions">
   <button id="mp-pickup">📦 PEGAR / ENTREGAR CARGA (L)</button>
   <button id="mp-weapon">⚠ ATIVAR ARMAMENTO: OFF</button>
@@ -938,9 +947,18 @@ class MainEngine {
     this.activeCrateMesh = null;
     this.activeCratePad = null;
     this.deliveryAvailable = false;
-    this.combatAimYaw = 0;
-    this.combatAimPitch = 0;
+    // Mira independente da câmera: posição normalizada dentro da área 3D.
+    this.combatAimX = 0.5;
+    this.combatAimY = 0.5;
     this.projectiles = [];
+    this.wantedLevel = 0;
+    this.wantedHeat = 0;
+    this.policeDrones = [];
+    this.lastPoliceSpawn = 0;
+    this.captureCooldown = 0;
+    this.audioContext = null;
+    this.openWorldEnabled = false;
+
 
     this.bindAuthUI();
     this.bindUI();
@@ -1168,25 +1186,22 @@ class MainEngine {
 
     document.addEventListener('mousedown', (e) => {
         if(e.button === 1) this.isMiddleMouseDown = true;
-        if(e.button === 0 && this.gameMode === 'multiplayer' && this.weaponEnabled && e.target.closest('#webgl-container')) {
-            if(document.pointerLockElement !== document.getElementById('webgl-container')) {
-                document.getElementById('webgl-container').requestPointerLock?.();
-            } else {
-                this.fireWeapon();
-            }
+        if(e.button !== 0 || this.gameMode !== 'multiplayer' || !this.weaponEnabled) return;
+        const area = document.getElementById('webgl-container');
+        if(area && (e.target === area || area.contains(e.target))) {
+            e.preventDefault();
+            this.updateCombatAimFromPointer(e.clientX, e.clientY);
+            this.fireWeapon();
         }
     });
     document.addEventListener('mouseup', (e) => { if(e.button === 1) this.isMiddleMouseDown = false; });
     document.addEventListener('mousemove', (e) => {
-        if(this.gameMode !== 'multiplayer' || !this.weaponEnabled ||
-           document.pointerLockElement !== document.getElementById('webgl-container')) return;
-        this.combatAimYaw -= e.movementX * 0.0022;
-        this.combatAimPitch -= e.movementY * 0.0022;
-        this.combatAimPitch = THREE.MathUtils.clamp(this.combatAimPitch, -0.85, 0.85);
-    });
-    document.addEventListener('pointerlockchange', () => {
-        const locked = document.pointerLockElement === document.getElementById('webgl-container');
-        document.getElementById('combat-crosshair').classList.toggle('locked', locked);
+        if(this.gameMode !== 'multiplayer' || !this.weaponEnabled) return;
+        const area = document.getElementById('webgl-container');
+        if(!area) return;
+        const rect = area.getBoundingClientRect();
+        if(e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) return;
+        this.updateCombatAimFromPointer(e.clientX, e.clientY);
     });
     
     document.addEventListener('wheel', (e) => {
@@ -1348,6 +1363,8 @@ class MainEngine {
         this.city = new CityGenerator(this.scene, textures);
         this.traffic = new TrafficSystem(this.scene, this.city); 
         this.pedestrians = new PedestrianSystem(this.scene, this.city);
+        this.openWorldEnabled = true;
+
         this.homePoint.set(25, 1, 30); // Ponto 0,0 garante o heliponto central
     }
     
@@ -1532,25 +1549,213 @@ class MainEngine {
   toggleWeapon() {
     if(this.gameMode!=='multiplayer') return;
     this.weaponEnabled=!this.weaponEnabled;
-    this.combatAimYaw = 0; this.combatAimPitch = 0;
-    if(!this.weaponEnabled && document.pointerLockElement) document.exitPointerLock?.();
+    this.combatAimX = 0.5; this.combatAimY = 0.5;
+    const area = document.getElementById('webgl-container');
+    if(area) {
+      const rect = area.getBoundingClientRect();
+      this.positionCombatCrosshair(rect.left + rect.width/2, rect.top + rect.height/2);
+    }
     document.getElementById('mp-weapon').classList.toggle('active',this.weaponEnabled);
     document.getElementById('mp-weapon').textContent=`⚠ ARMAMENTO: ${this.weaponEnabled?'ON':'OFF'}`;
     document.getElementById('combat-crosshair').style.display=this.weaponEnabled?'block':'none';
     if(this.socket) this.socket.emit('weapon_toggle',{enabled:this.weaponEnabled});
-    this.showMsg(this.weaponEnabled?'COMBATE ATIVO — CLIQUE NA ÁREA DE VOO PARA CONTROLAR A MIRA COM O MOUSE. ESC LIBERA.':'SISTEMA DE COMBATE DESATIVADO',this.weaponEnabled?'var(--dji-red)':'var(--dji-green)');
+    this.showMsg(this.weaponEnabled?'COMBATE ATIVO — MOVA A MIRA COM O MOUSE E CLIQUE COM O BOTÃO ESQUERDO PARA ATIRAR. A CÂMERA NÃO SERÁ MOVIDA PELA MIRA.':'SISTEMA DE COMBATE DESATIVADO',this.weaponEnabled?'var(--dji-red)':'var(--dji-green)');
+  }
+
+  positionCombatCrosshair(clientX, clientY) {
+    const crosshair = document.getElementById('combat-crosshair');
+    if(!crosshair) return;
+    crosshair.style.left = `${clientX}px`;
+    crosshair.style.top = `${clientY}px`;
+  }
+
+  updateCombatAimFromPointer(clientX, clientY) {
+    const area = document.getElementById('webgl-container');
+    if(!area) return;
+    const rect = area.getBoundingClientRect();
+    if(!rect.width || !rect.height) return;
+    this.combatAimX = THREE.MathUtils.clamp((clientX - rect.left) / rect.width, 0, 1);
+    this.combatAimY = THREE.MathUtils.clamp((clientY - rect.top) / rect.height, 0, 1);
+    this.positionCombatCrosshair(clientX, clientY);
   }
 
   fireWeapon() {
-    if(this.gameMode!=='multiplayer'||!this.weaponEnabled||!this.socket||!this.socket.connected) return;
-    const now=Date.now(); if(now-this.lastShotAt<350) return; this.lastShotAt=now;
+    if(this.gameMode!=='multiplayer'||!this.weaponEnabled) return;
+    if(!this.socket||!this.socket.connected) {
+      this.showMsg('AGUARDE A CONEXÃO MULTIPLAYER PARA ATIRAR.', 'var(--dji-red)');
+      return;
+    }
+    const now=Date.now();
+    if(now-this.lastShotAt<260) return;
+    this.lastShotAt=now;
     const origin=this.camera.getWorldPosition(new THREE.Vector3());
-    const direction=this.camera.getWorldDirection(new THREE.Vector3()).normalize();
-    const end=origin.clone().add(direction.clone().multiplyScalar(500));
-    const geometry=new THREE.BufferGeometry().setFromPoints([origin,end]);
-    const line=new THREE.Line(geometry,new THREE.LineBasicMaterial({color:0xff4136,transparent:true,opacity:.9}));
-    this.scene.add(line); setTimeout(()=>{this.scene.remove(line);geometry.dispose();line.material.dispose();},100);
+    const ndc=new THREE.Vector2(this.combatAimX*2-1,1-this.combatAimY*2);
+    this.raycaster.setFromCamera(ndc,this.camera);
+    this.raycaster.far=420;
+    const direction=this.raycaster.ray.direction.clone().normalize();
+    const end=origin.clone().add(direction.clone().multiplyScalar(420));
+    const geometry=new THREE.BufferGeometry().setFromPoints([origin.clone(),end.clone()]);
+    const line=new THREE.Line(geometry,new THREE.LineBasicMaterial({color:0xffe36b,transparent:true,opacity:1}));
+    line.renderOrder=1500; this.scene.add(line);
+    const flash=new THREE.Mesh(new THREE.SphereGeometry(.22,8,8),new THREE.MeshBasicMaterial({color:0xffbb33,transparent:true,opacity:.95}));
+    flash.position.copy(origin); this.scene.add(flash);
+    setTimeout(()=>{this.scene.remove(line);geometry.dispose();line.material.dispose();this.scene.remove(flash);flash.geometry.dispose();flash.material.dispose();},150);
+    this.playWeaponSound();
+
+    const targets=[];
+    if(this.pedestrians) this.pedestrians.people.forEach(person=>{if(person.alive!==false)targets.push({kind:'person',data:person,root:person.mesh});});
+    if(this.traffic) this.traffic.cars.forEach(car=>{if(car.alive!==false)targets.push({kind:'car',data:car,root:car.mesh});});
+    this.policeDrones.forEach(police=>{if(police.alive)targets.push({kind:'police',data:police,root:police.root});});
+    let targetHit=null, hitDistance=Infinity;
+    for(const target of targets) {
+      const hits=this.raycaster.intersectObject(target.root,true);
+      if(hits.length && hits[0].distance<hitDistance){hitDistance=hits[0].distance;targetHit=target;}
+    }
+    if(targetHit) {
+      const impact=origin.clone().add(direction.clone().multiplyScalar(hitDistance));
+      this.createImpactEffect(impact,targetHit.kind==='car'?0xff8a22:0xffe36b);
+      if(targetHit.kind==='person') {
+        this.disablePedestrian(targetHit.data);
+        this.increaseWanted(1,'AGRESSÃO A PEDESTRE');
+        this.showMsg('PEDESTRE ATINGIDO — PROCURADO PELA POLÍCIA', 'var(--dji-red)');
+      } else if(targetHit.kind==='car') {
+        this.explodeCar(targetHit.data);
+        this.increaseWanted(2,'VEÍCULO DESTRUÍDO');
+        this.showMsg('CARRO EXPLODIU — POLÍCIA ALERTADA', 'var(--dji-red)');
+      } else {
+        targetHit.data.health-=25; this.updatePoliceHealth(targetHit.data);
+        if(targetHit.data.health<=0){this.destroyPoliceDrone(targetHit.data);this.showMsg('DRONE POLICIAL DESTRUÍDO!', 'var(--dji-green)');}
+        else this.showMsg(`DRONE POLICIAL ATINGIDO — ${targetHit.data.health}%`, 'var(--dji-red)');
+      }
+    } else this.showMsg('DISPARO EFETUADO', 'var(--dji-red)');
     this.socket.emit('fire_weapon',{position:{x:origin.x,y:origin.y,z:origin.z},direction:{x:direction.x,y:direction.y,z:direction.z}});
+  }
+
+  playWeaponSound() {
+    try {
+      const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+      if(!this.audioContext)this.audioContext=new AC();
+      const ctx=this.audioContext,now=ctx.currentTime;
+      if(ctx.state==='suspended')ctx.resume();
+      const osc=ctx.createOscillator(),gain=ctx.createGain(),filter=ctx.createBiquadFilter();
+      osc.type='sawtooth';osc.frequency.setValueAtTime(155,now);osc.frequency.exponentialRampToValueAtTime(45,now+.13);
+      filter.type='lowpass';filter.frequency.value=950;
+      gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(.24,now+.008);gain.gain.exponentialRampToValueAtTime(.0001,now+.17);
+      osc.connect(filter);filter.connect(gain);gain.connect(ctx.destination);osc.start(now);osc.stop(now+.18);
+    } catch(e){console.warn('Áudio do disparo indisponível',e);}
+  }
+
+  playExplosionSound() {
+    try {
+      const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+      if(!this.audioContext)this.audioContext=new AC();
+      const ctx=this.audioContext,now=ctx.currentTime;
+      if(ctx.state==='suspended')ctx.resume();
+      const osc=ctx.createOscillator(),gain=ctx.createGain();
+      osc.type='triangle';osc.frequency.setValueAtTime(100,now);osc.frequency.exponentialRampToValueAtTime(25,now+.55);
+      gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(.4,now+.02);gain.gain.exponentialRampToValueAtTime(.0001,now+.65);
+      osc.connect(gain);gain.connect(ctx.destination);osc.start(now);osc.stop(now+.66);
+    }catch(e){}
+  }
+
+  createImpactEffect(pos,color=0xffcc55) {
+    const mesh=new THREE.Mesh(new THREE.SphereGeometry(.55,10,8),new THREE.MeshBasicMaterial({color,transparent:true,opacity:.9}));
+    mesh.position.copy(pos);this.scene.add(mesh);const t0=Date.now();
+    const step=()=>{if(!mesh.parent)return;const t=(Date.now()-t0)/260;mesh.scale.setScalar(1+t*2.5);mesh.material.opacity=Math.max(0,1-t);if(t>=1){this.scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose();}else requestAnimationFrame(step);};step();
+  }
+
+  createExplosion(pos,color=0xff7622) {
+    const group=new THREE.Group();group.position.copy(pos);this.scene.add(group);
+    for(let i=0;i<20;i++){
+      const m=new THREE.Mesh(new THREE.SphereGeometry(.18+Math.random()*.28,6,5),new THREE.MeshBasicMaterial({color:i%3===0?0xffdf66:color,transparent:true,opacity:1}));
+      m.position.set((Math.random()-.5)*2,(Math.random()-.2)*2,(Math.random()-.5)*2);group.add(m);
+    }
+    const t0=Date.now();const tick=()=>{if(!group.parent)return;const t=(Date.now()-t0)/950;group.children.forEach((m,i)=>{m.position.y+=.025+(i%4)*.008;m.scale.multiplyScalar(1.02);m.material.opacity=Math.max(0,1-t);});if(t>=1){this.scene.remove(group);group.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material)o.material.dispose();});}else requestAnimationFrame(tick);};tick();this.playExplosionSound();
+  }
+
+  increaseWanted(amount=1,reason='ATIVIDADE ILEGAL') {
+    this.wantedLevel=Math.min(5,this.wantedLevel+amount);this.wantedHeat=Date.now();this.updateWantedHUD(reason);this.ensurePoliceDrones();
+  }
+
+  updateWantedHUD(reason='') {
+    const hud=document.getElementById('wanted-hud');if(!hud)return;
+    hud.style.display=this.wantedLevel>0?'block':'none';
+    document.getElementById('wanted-stars').textContent='★'.repeat(this.wantedLevel)+'☆'.repeat(5-this.wantedLevel);
+    document.getElementById('wanted-status').textContent=this.wantedLevel>0?`POLÍCIA: ${this.policeDrones.filter(p=>p.alive).length} DRONE(S) NA ÁREA`:'POLÍCIA: SEM ALERTA';
+    if(reason)document.getElementById('wanted-label').textContent=reason;
+  }
+
+  ensurePoliceDrones() {
+    if(!this.drone||!this.scene)return;
+    const desired=Math.min(7,this.wantedLevel+1);
+    while(this.policeDrones.filter(p=>p.alive).length<desired)this.spawnPoliceDrone();
+  }
+
+  spawnPoliceDrone() {
+    const root=new THREE.Group();
+    const bodyMat=new THREE.MeshStandardMaterial({color:0x172b55,metalness:.4,roughness:.35,emissive:0x061b55});
+    const red=new THREE.MeshBasicMaterial({color:0xff2020});
+    root.add(new THREE.Mesh(new THREE.BoxGeometry(1.5,.38,1.1),bodyMat));
+    for(const x of [-.85,.85])for(const z of [-.65,.65]){
+      const arm=new THREE.Mesh(new THREE.BoxGeometry(.9,.08,.08),bodyMat);arm.position.set(x*.5,0,z*.5);root.add(arm);
+      const rotor=new THREE.Mesh(new THREE.CylinderGeometry(.32,.32,.035,12),red);rotor.position.set(x,.12,z);root.add(rotor);
+    }
+    const lamp=new THREE.PointLight(0xff2222,1.2,14);lamp.position.y=.35;root.add(lamp);
+    const bg=new THREE.Mesh(new THREE.PlaneGeometry(3.8,.22),new THREE.MeshBasicMaterial({color:0x330000,side:THREE.DoubleSide}));bg.position.y=1.4;root.add(bg);
+    const fill=new THREE.Mesh(new THREE.PlaneGeometry(3.8,.18),new THREE.MeshBasicMaterial({color:0x45e36d,side:THREE.DoubleSide}));fill.position.set(0,1.41,.01);root.add(fill);
+    const pp=this.drone.obj.position,angle=Math.random()*Math.PI*2,d=100+Math.random()*70;
+    root.position.set(pp.x+Math.cos(angle)*d,pp.y+25+Math.random()*12,pp.z+Math.sin(angle)*d);this.scene.add(root);
+    this.policeDrones.push({root,health:100,healthFill:fill,alive:true,speed:10+this.wantedLevel*3,phase:Math.random()*6});
+    this.updateWantedHUD();
+  }
+
+  updatePoliceHealth(p) {
+    p.healthFill.scale.x=Math.max(.001,p.health/100);p.healthFill.position.x=-1.9+1.9*(p.health/100);
+    p.healthFill.material.color.setHex(p.health>50?0x45e36d:(p.health>25?0xffb020:0xff3030));
+  }
+
+  destroyPoliceDrone(p) {
+    if(!p.alive)return;p.alive=false;this.createExplosion(p.root.position,0x3388ff);this.scene.remove(p.root);
+    this.increaseWanted(1,'DRONE POLICIAL DESTRUÍDO');
+    setTimeout(()=>{if(this.wantedLevel>0)this.spawnPoliceDrone();},12000);
+  }
+
+  disablePedestrian(person) {
+    if(person.alive===false)return;person.alive=false;const pos=person.mesh.position.clone();this.scene.remove(person.mesh);
+    this.createImpactEffect(pos.clone().add(new THREE.Vector3(0,1,0)),0xff5555);
+    setTimeout(()=>{if(!this.scene||!this.pedestrians)return;person.mesh.position.set(Math.random()*1800-900,.52,Math.random()*1800-900);person.mesh.visible=true;person.alive=true;this.scene.add(person.mesh);},18000);
+  }
+
+  explodeCar(car) {
+    if(car.alive===false)return;car.alive=false;const pos=car.mesh.position.clone();this.scene.remove(car.mesh);this.createExplosion(pos,0xff7622);
+    setTimeout(()=>{if(!this.scene||!this.traffic)return;car.mesh.position.set(Math.random()*1800-900,.52,Math.random()*1800-900);car.alive=true;this.scene.add(car.mesh);},25000);
+  }
+
+  updateOpenWorld(dt) {
+    if(!this.drone||!this.physics)return;const pos=this.drone.obj.position;
+    const active=this.policeDrones.filter(p=>p.alive);
+    active.forEach(p=>{
+      p.phase+=dt*7;
+      const target=pos.clone().add(new THREE.Vector3(Math.sin(p.phase)*5,5+Math.sin(p.phase*.7)*1.5,Math.cos(p.phase)*5));
+      p.root.position.lerp(target,Math.min(1,dt*(.35+p.speed*.035)));p.root.lookAt(pos);
+      if(p.root.position.distanceTo(pos)<9&&this.captureCooldown<=0)this.capturePlayer();
+    });
+    if(this.captureCooldown>0)this.captureCooldown-=dt;
+    if(this.wantedLevel>0&&Date.now()-this.wantedHeat>90000&&active.length===0){this.wantedLevel=Math.max(0,this.wantedLevel-1);this.wantedHeat=Date.now();}
+    this.updateWantedHUD();
+  }
+
+  capturePlayer() {
+    this.captureCooldown=8;this.showMsg('VOCÊ FOI CAPTURADO! REINICIANDO A OPERAÇÃO...', 'var(--dji-red)');
+    this.wantedLevel=0;this.wantedHeat=0;this.policeDrones.forEach(p=>{if(p.root.parent)this.scene.remove(p.root);});this.policeDrones=[];
+    if(this.physics&&this.homePoint)this.physics.reset(this.homePoint);
+    if(this.drone&&this.homePoint)this.drone.obj.position.copy(this.homePoint);
+    this.state=FLIGHT_STATES.STANDBY;
+    if(this.audio)this.audio.stopMotors();
+    const flightStatus=document.getElementById('flight-status');
+    if(flightStatus){flightStatus.innerText='MOTORES DESLIGADOS';flightStatus.className='status-item';}
+    this.weaponEnabled=false;const btn=document.getElementById('mp-weapon');if(btn){btn.classList.remove('active');btn.textContent='⚠ ARMAMENTO: OFF';}
+    document.getElementById('combat-crosshair').style.display='none';this.updateWantedHUD();
   }
 
   updateRemoteWeapon(data) {
@@ -1781,17 +1986,6 @@ class MainEngine {
 
   updateCamera(dt) {
     if(this.state === FLIGHT_STATES.CRASHED) return; 
-    if (this.gameMode==='multiplayer' && this.weaponEnabled) {
-      const baseYaw=this.drone.rotation.yaw || 0;
-      const yaw=baseYaw+this.combatAimYaw;
-      const pitch=this.combatAimPitch;
-      const dir=new THREE.Vector3(-Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),-Math.cos(yaw)*Math.cos(pitch));
-      const target=this.drone.obj.position.clone().add(dir.multiplyScalar(100));
-      const camPos=this.drone.obj.position.clone().add(new THREE.Vector3(0,2.2,0));
-      this.camera.position.lerp(camPos,Math.min(1,dt*12));
-      this.camera.lookAt(target);
-      return;
-    }
     if (this.camMode === 'chase') {
       const offset = new THREE.Vector3(0, 3, 10);
       const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), this.drone.rotation.yaw);
@@ -1888,6 +2082,8 @@ class MainEngine {
     this.updateCamera(dt);
     this.updateTelemetry(dt);
     this.updateMultiplayer(dt);
+    if(this.gameMode === 'multiplayer' && !this.customScenarioMode) this.updateOpenWorld(dt);
+
     
     // Atualiza a posição e opacidade da sombra projetada no solo
     if (this.dropShadow && this.drone && this.physics) {
@@ -2646,7 +2842,7 @@ class PedestrianSystem {
         const colors = [0xcc4444, 0x44cc44, 0x4444cc, 0xffaa00, 0xeeeeee, 0x222222];
         const skinColors = [0xffccaa, 0xd2b48c, 0x8d5524, 0x3d2314, 0xf1c27d];
 
-        for(let i = 0; i < 200; i++) { 
+        for(let i = 0; i < 360; i++) { 
             const personGroup = new THREE.Group();
             const bodyColor = colors[Math.floor(Math.random() * colors.length)];
             const skinColor = skinColors[Math.floor(Math.random() * skinColors.length)];
@@ -2717,7 +2913,7 @@ class TrafficSystem {
     constructor(scene, city) { this.scene = scene; this.city = city; this.cars = []; this.createCars(); }
     createCars() {
         const colors = [0xff0000, 0x0000ff, 0xffffff, 0x222222, 0xaaaaaa, 0xffff00, 0x00aa00];
-        for(let i = 0; i < 200; i++) { 
+        for(let i = 0; i < 260; i++) { 
             const vehicleGroup = new THREE.Group();
             const color = colors[Math.floor(Math.random() * colors.length)];
             const typeRoll = Math.random();
